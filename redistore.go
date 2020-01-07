@@ -6,7 +6,9 @@ package redistore
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/base32"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -83,7 +85,7 @@ func (s GobSerializer) Deserialize(d []byte, ss *sessions.Session) error {
 
 // RediStore stores sessions in a redis backend.
 type RediStore struct {
-	Pool          *redis.Pool
+	PoolList      []*redis.Pool
 	Codecs        []securecookie.Codec
 	Options       *sessions.Options // default configuration
 	DefaultMaxAge int               // default Redis TTL for a MaxAge == 0 session
@@ -154,15 +156,17 @@ func dial(network, address, password string) (redis.Conn, error) {
 // NewRediStore returns a new RediStore.
 // size: maximum number of idle connections.
 func NewRediStore(size int, network, address, password string, keyPairs ...[]byte) (*RediStore, error) {
-	return NewRediStoreWithPool(&redis.Pool{
-		MaxIdle:     size,
-		IdleTimeout: 240 * time.Second,
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			return err
-		},
-		Dial: func() (redis.Conn, error) {
-			return dial(network, address, password)
+	return NewRediStoreWithPool([]*redis.Pool{
+		&redis.Pool{
+			MaxIdle:     size,
+			IdleTimeout: 240 * time.Second,
+			TestOnBorrow: func(c redis.Conn, t time.Time) error {
+				_, err := c.Do("PING")
+				return err
+			},
+			Dial: func() (redis.Conn, error) {
+				return dial(network, address, password)
+			},
 		},
 	}, keyPairs...)
 }
@@ -182,25 +186,27 @@ func dialWithDB(network, address, password, DB string) (redis.Conn, error) {
 // NewRediStoreWithDB - like NewRedisStore but accepts `DB` parameter to select
 // redis DB instead of using the default one ("0")
 func NewRediStoreWithDB(size int, network, address, password, DB string, keyPairs ...[]byte) (*RediStore, error) {
-	return NewRediStoreWithPool(&redis.Pool{
-		MaxIdle:     size,
-		IdleTimeout: 240 * time.Second,
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			return err
-		},
-		Dial: func() (redis.Conn, error) {
-			return dialWithDB(network, address, password, DB)
+	return NewRediStoreWithPool([]*redis.Pool{
+		&redis.Pool{
+			MaxIdle:     size,
+			IdleTimeout: 240 * time.Second,
+			TestOnBorrow: func(c redis.Conn, t time.Time) error {
+				_, err := c.Do("PING")
+				return err
+			},
+			Dial: func() (redis.Conn, error) {
+				return dialWithDB(network, address, password, DB)
+			},
 		},
 	}, keyPairs...)
 }
 
 // NewRediStoreWithPool instantiates a RediStore with a *redis.Pool passed in.
-func NewRediStoreWithPool(pool *redis.Pool, keyPairs ...[]byte) (*RediStore, error) {
+func NewRediStoreWithPool(poolList []*redis.Pool, keyPairs ...[]byte) (*RediStore, error) {
 	rs := &RediStore{
 		// http://godoc.org/github.com/gomodule/redigo/redis#Pool
-		Pool:   pool,
-		Codecs: securecookie.CodecsFromPairs(keyPairs...),
+		PoolList: poolList,
+		Codecs:   securecookie.CodecsFromPairs(keyPairs...),
 		Options: &sessions.Options{
 			Path:   "/",
 			MaxAge: sessionExpire,
@@ -216,7 +222,10 @@ func NewRediStoreWithPool(pool *redis.Pool, keyPairs ...[]byte) (*RediStore, err
 
 // Close closes the underlying *redis.Pool
 func (s *RediStore) Close() error {
-	return s.Pool.Close()
+	for _, pool := range s.PoolList {
+		pool.Close()
+	}
+	return nil
 }
 
 // Get returns a session for the given name after adding it to the registry.
@@ -274,36 +283,20 @@ func (s *RediStore) Save(r *http.Request, w http.ResponseWriter, session *sessio
 	return nil
 }
 
-// Delete removes the session from redis, and sets the cookie to expire.
-//
-// WARNING: This method should be considered deprecated since it is not exposed via the gorilla/sessions interface.
-// Set session.Options.MaxAge = -1 and call Save instead. - July 18th, 2013
-func (s *RediStore) Delete(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
-	conn := s.Pool.Get()
-	defer conn.Close()
-	if _, err := conn.Do("DEL", s.keyPrefix+session.ID); err != nil {
-		return err
-	}
-	// Set cookie to expire.
-	options := *session.Options
-	options.MaxAge = -1
-	http.SetCookie(w, sessions.NewCookie(session.Name(), "", &options))
-	// Clear session values.
-	for k := range session.Values {
-		delete(session.Values, k)
-	}
-	return nil
-}
-
 // ping does an internal ping against a server to check if it is alive.
 func (s *RediStore) ping() (bool, error) {
-	conn := s.Pool.Get()
-	defer conn.Close()
-	data, err := conn.Do("PING")
-	if err != nil || data == nil {
-		return false, err
+	for _, pool := range s.PoolList {
+		conn := pool.Get()
+		defer conn.Close()
+		data, err := conn.Do("PING")
+		if err != nil || data == nil {
+			return false, err
+		}
+		if data != "PONG" {
+			return false, errors.New("Redis ping error")
+		}
 	}
-	return (data == "PONG"), nil
+	return true, nil
 }
 
 // save stores the session in redis.
@@ -315,7 +308,9 @@ func (s *RediStore) save(session *sessions.Session) error {
 	if s.maxLength != 0 && len(b) > s.maxLength {
 		return errors.New("SessionStore: the value to store is too big")
 	}
-	conn := s.Pool.Get()
+	hashBytes := md5.Sum([]byte(session.ID))
+	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
+	conn := s.PoolList[int(hashKey)%len(s.PoolList)].Get()
 	defer conn.Close()
 	if err = conn.Err(); err != nil {
 		return err
@@ -331,7 +326,9 @@ func (s *RediStore) save(session *sessions.Session) error {
 // load reads the session from redis.
 // returns true if there is a sessoin data in DB
 func (s *RediStore) load(session *sessions.Session) (bool, error) {
-	conn := s.Pool.Get()
+	hashBytes := md5.Sum([]byte(session.ID))
+	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
+	conn := s.PoolList[int(hashKey)%len(s.PoolList)].Get()
 	defer conn.Close()
 	if err := conn.Err(); err != nil {
 		return false, err
@@ -352,7 +349,9 @@ func (s *RediStore) load(session *sessions.Session) (bool, error) {
 
 // delete removes keys from redis if MaxAge<0
 func (s *RediStore) delete(session *sessions.Session) error {
-	conn := s.Pool.Get()
+	hashBytes := md5.Sum([]byte(session.ID))
+	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
+	conn := s.PoolList[int(hashKey)%len(s.PoolList)].Get()
 	defer conn.Close()
 	if _, err := conn.Do("DEL", s.keyPrefix+session.ID); err != nil {
 		return err
