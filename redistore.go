@@ -308,9 +308,7 @@ func (s *RediStore) save(session *sessions.Session) error {
 	if s.maxLength != 0 && len(b) > s.maxLength {
 		return errors.New("SessionStore: the value to store is too big")
 	}
-	hashBytes := md5.Sum([]byte(session.ID))
-	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
-	conn := s.PoolList[int(hashKey)%len(s.PoolList)].Get()
+	conn := getConn(s.PoolList, session.ID)
 	defer conn.Close()
 	if err = conn.Err(); err != nil {
 		return err
@@ -326,9 +324,7 @@ func (s *RediStore) save(session *sessions.Session) error {
 // load reads the session from redis.
 // returns true if there is a sessoin data in DB
 func (s *RediStore) load(session *sessions.Session) (bool, error) {
-	hashBytes := md5.Sum([]byte(session.ID))
-	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
-	conn := s.PoolList[int(hashKey)%len(s.PoolList)].Get()
+	conn := getConn(s.PoolList, session.ID)
 	defer conn.Close()
 	if err := conn.Err(); err != nil {
 		return false, err
@@ -349,12 +345,17 @@ func (s *RediStore) load(session *sessions.Session) (bool, error) {
 
 // delete removes keys from redis if MaxAge<0
 func (s *RediStore) delete(session *sessions.Session) error {
-	hashBytes := md5.Sum([]byte(session.ID))
-	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
-	conn := s.PoolList[int(hashKey)%len(s.PoolList)].Get()
+	conn := getConn(s.PoolList, session.ID)
 	defer conn.Close()
 	if _, err := conn.Do("DEL", s.keyPrefix+session.ID); err != nil {
 		return err
 	}
 	return nil
+}
+
+func getConn(poolList []*redis.Pool, sessionID string) redis.Conn {
+	hashBytes := md5.Sum([]byte(sessionID))
+	hashKey := binary.BigEndian.Uint64(hashBytes[:8])
+	conn := poolList[hashKey%uint64(len(poolList))].Get()
+	return conn
 }
